@@ -1,0 +1,7 @@
+streamlit
+requests
+pandas
+xlsxwriter
+
+# 개발용
+pytest

@@ -1,0 +1,10 @@
+.env
+data/
+*.xlsx
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# 로컬 전용 (절대경로·머신별 설정)
+.claude/settings.local.json
