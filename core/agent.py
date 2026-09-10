@@ -205,7 +205,17 @@ def _judge_batch(conn, run_id, seq, batch, set_row, threads, state, limits, judg
 
     for it in range(limits["iterations"]):
         user = f"[기존 이슈]\n{history}\n\n[판정할 묶음]\n{_render(batch, bodies)}"
-        parsed, usage = judge_fn(system, user, JUDGE_SCHEMA, model=model)
+        try:
+            parsed, usage = judge_fn(system, user, JUDGE_SCHEMA, model=model)
+        except Exception as e:
+            # 판정 실패로 실행 전체를 죽이지 않는다. 이 배치만 미판정으로 남기면
+            # `보류` 상태로 목록에 남고 --resume이 이어서 처리한다.
+            # 도구 실패를 품질 저하로 흡수하는 §4.3의 원칙과 같다.
+            db.log_step(conn, run_id, seq[0], "judge",
+                        reason=f"묶음 {len(batch)}개 판정 (반복 {it + 1})",
+                        success=False, error=f"{type(e).__name__}: {e}"[:200])
+            seq[0] += 1
+            break
         state["tokens"] += usage["in"] + usage["out"]
         state["cost"] += usage["cost"]
         db.log_step(conn, run_id, seq[0], "judge",

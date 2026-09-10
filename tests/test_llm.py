@@ -49,9 +49,30 @@ def test_broken_json_retries_then_raises():
         calls.append(1)
         return {"message": {"content": ""}, "prompt_eval_count": 1, "eval_count": 1}
 
-    with pytest.raises(ValueError, match="스키마"):
+    with pytest.raises(ValueError, match="판정 호출 실패"):
         llm.judge("sys", "user", SCHEMA, post=post)
-    assert len(calls) == 2                 # 1회 재시도 후 포기
+    assert len(calls) == 3                 # 3회 시도 후 포기
+
+
+def test_transient_http_error_is_retried(monkeypatch):
+    """모델 콜드 스타트 구간에서 실제로 났다.
+
+    Ollama가 /api/tags에는 응답하는데 모델 로딩(약 10초) 중이라 요청이 거절된다.
+    한 번 튕겼다고 30분짜리 실행을 죽일 이유가 없다.
+    """
+    monkeypatch.setattr(llm.time, "sleep", lambda _: None)
+    calls = []
+
+    def post(url, payload, timeout):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("model is loading")
+        return {"message": {"content": json.dumps({"importance": "필수"})},
+                "prompt_eval_count": 10, "eval_count": 5}
+
+    parsed, usage = llm.judge("sys", "user", SCHEMA, post=post)
+    assert parsed == {"importance": "필수"}
+    assert usage["attempts"] == 2
 
 
 def test_api_model_cost_is_computed():

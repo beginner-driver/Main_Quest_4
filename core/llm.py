@@ -59,9 +59,18 @@ def judge(system, user, schema, model=None, url=None, timeout=300, post=None):
     }
 
     last_error = None
-    for attempt in range(2):
+    for attempt in range(3):
         t0 = time.time()
-        body = post(url, payload, timeout)
+        try:
+            body = post(url, payload, timeout)
+        except Exception as e:
+            # 네트워크·HTTP 오류. 모델 콜드 스타트 때 실제로 났다 —
+            # Ollama가 /api/tags에는 응답하는데 모델 로딩(약 10초) 중이라
+            # 요청이 거절되는 구간이 있다. 짧게 기다렸다 다시 부른다.
+            last_error = f"{type(e).__name__}: {e}"
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
+            continue
         elapsed = time.time() - t0
         content = (body.get("message") or {}).get("content") or ""
         try:
@@ -76,7 +85,7 @@ def judge(system, user, schema, model=None, url=None, timeout=300, post=None):
             "model": model, "cost": cost_of(model, tin, tout),
             "attempts": attempt + 1,
         }
-    raise ValueError(f"모델이 스키마를 지키지 못했습니다: {last_error}")
+    raise ValueError(f"판정 호출 실패 (3회 시도): {last_error}")
 
 
 def available(url=None, timeout=3):

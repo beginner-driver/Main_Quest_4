@@ -349,3 +349,25 @@ def test_title_head_match_ignores_spacing():
                            "law": "사회연대경제기본법", "reason": "통과"}]}
     v = agent._collect_verdicts(parsed, batch, {})
     assert v[1]["reason"] == "통과"           # id가 틀려도 제목으로 찾는다
+
+
+def test_judge_failure_leaves_batch_pending_not_crash(conn, set_id):
+    """판정 호출이 죽어도 실행 전체가 죽지 않는다.
+
+    Ollama가 순간적으로 흔들리면 30분짜리 실행이 통째로 날아가던 구조였다.
+    이제 그 배치만 미판정으로 남고 --resume이 이어서 처리한다.
+    """
+    def dying_judge(system, user, schema, model=None, **kw):
+        raise ConnectionError("ollama died")
+
+    rid = agent.run_agent(conn, set_id, search_fn=fake_search(distinct_articles(6)),
+                          judge_fn=dying_judge)
+    run = db.get_run(conn, rid)
+    assert run["status"] == "limit"                 # 완료로 위장하지 않는다
+    assert _count(conn, "held") == run["thread_count"]
+    failed = [s for s in db.run_steps(conn, rid) if not s["success"]]
+    assert failed and "ConnectionError" in failed[0]["error"]
+
+    # 되살아나면 이어서 마저 판정된다
+    agent.resume(conn, rid, judge_fn=fake_judge())
+    assert _count(conn, "held") == 0 and _count(conn, "judged") > 0
