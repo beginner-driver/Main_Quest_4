@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS thread (
     reason           TEXT NOT NULL DEFAULT '',
     agent_label      TEXT,   -- 에이전트 원안. 사람 확정값과 비교해 수정률을 계산한다
     agent_importance TEXT,
+    agent_code       TEXT,   -- 모델이 고른 항목 (A~F/none). 등급은 코드가 매핑한다
+    agent_law        TEXT,   -- code=B일 때 모델이 댄 법령명. 기사 원문과 대조해 검증한다
     status           TEXT NOT NULL DEFAULT 'pending', -- pending / judged / held / confirmed
     confirmed_at     TEXT
 );

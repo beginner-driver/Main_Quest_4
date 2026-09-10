@@ -23,8 +23,18 @@ def connect(path=None):
     return conn
 
 
+#  기존 DB에 나중에 추가된 칸. CREATE TABLE IF NOT EXISTS는 기존 테이블을 건드리지
+#  않으므로 여기서 채워 넣는다. nullable 컬럼 추가는 SQLite에서 즉시 끝난다.
+_ADDED_COLUMNS = [("thread", "agent_code", "TEXT"),
+                  ("thread", "agent_law", "TEXT")]
+
+
 def init_db(conn):
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    for table, col, decl in _ADDED_COLUMNS:
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if col not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     conn.commit()
 
 
@@ -192,6 +202,37 @@ def confirm_thread(conn, thread_id, label, importance, reason=None):
             " confirmed_at=datetime('now','localtime') WHERE id=?",
             (label, importance, reason, thread_id))
     conn.commit()
+
+
+GRADE_RANK = {"참고": 0, "필수": 1, "최우선": 2}
+
+
+def miss_rate(conn, keyword_set_id, days=30):
+    """최근 N일 누락률 (PRD §10 수용 기준 3번).
+
+    수정률은 방향을 구분하지 않는다. 그런데 두 방향의 의미가 전혀 다르다.
+
+        AI 최우선 → 사람이 내림   과잉. 귀찮을 뿐 놓치지는 않는다
+        AI 참고   → 사람이 올림   놓칠 뻔한 것. 이 도구를 만든 이유가 이것이다
+
+    누락률은 뒤쪽만 센다. 확정된 이슈 중 사람이 등급을 올린 비율.
+    """
+    rows = conn.execute(
+        "SELECT importance, agent_importance FROM thread"
+        " WHERE keyword_set_id = ? AND status = 'confirmed'"
+        "   AND agent_importance IS NOT NULL"
+        "   AND confirmed_at >= date('now','localtime',?)",
+        (keyword_set_id, f"-{int(days)} days"),
+    ).fetchall()
+    total = len(rows)
+    missed = sum(1 for r in rows
+                 if GRADE_RANK.get(r["importance"], 0)
+                 > GRADE_RANK.get(r["agent_importance"], 0))
+    over = sum(1 for r in rows
+               if GRADE_RANK.get(r["importance"], 0)
+               < GRADE_RANK.get(r["agent_importance"], 0))
+    return {"total": total, "missed": missed, "over": over,
+            "rate": (missed / total) if total else 0.0}
 
 
 def revision_rate(conn, keyword_set_id, days=30):

@@ -16,7 +16,7 @@ import time
 import requests
 
 DEFAULT_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:2b")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
 
 # 로컬 추론은 0원. API로 바꿀 때만 채운다. (입력, 출력) USD per 1M tokens
 PRICING = {

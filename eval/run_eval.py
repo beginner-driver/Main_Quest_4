@@ -9,15 +9,17 @@
 을 검증하는 실험이기 때문이다.
 """
 import argparse
+import copy
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core import agent, cluster, collect, db  # noqa: E402
+from core import agent, cluster, collect, db, llm  # noqa: E402
 from main import load_env  # noqa: E402
 
 
@@ -102,45 +104,86 @@ def exp_cluster(conn, set_name, thresholds):
 
 # --- (나)(다) 모델·프롬프트 --------------------------------------------------
 
-def _run_variant(conn, set_id, hours, label, model=None, drop_criteria=False):
-    saved = None
-    if drop_criteria:
-        saved = conn.execute("SELECT criteria FROM keyword_set WHERE id=?",
-                             (set_id,)).fetchone()["criteria"]
-        conn.execute("UPDATE keyword_set SET criteria='' WHERE id=?", (set_id,))
-        conn.commit()
-    t0 = time.time()
-    try:
-        rid = agent.run_agent(conn, set_id, hours=hours, model=model)
-    finally:
-        if saved is not None:
-            conn.execute("UPDATE keyword_set SET criteria=? WHERE id=?", (saved, set_id))
-            conn.commit()
-    run = db.get_run(conn, rid)
-    threads = [t for t in db.recent_threads(conn, set_id, days=3650) if t["run_id"] == rid]
-    dist = {g: sum(1 for t in threads if t["importance"] == g)
-            for g in ["최우선", "필수", "참고"]}
-    return [label, run["item_count"], run["thread_count"],
-            f"{time.time() - t0:.0f}초", run["tokens_in"], f"${run['cost']:.4f}",
-            dist["최우선"], dist["필수"], dist["참고"], run["status"]]
+HEAD = ["세팅", "묶음", "판정", "미판정", "소요", "토큰", "비용",
+        "최우선", "필수", "참고", "근거길이"]
 
 
-HEAD = ["세팅", "수집", "묶음", "소요", "토큰", "비용", "최우선", "필수", "참고", "상태"]
+def _fetch_once(set_row, hours):
+    """기사를 한 번만 수집한다. 모든 세팅이 같은 입력을 본다."""
+    cid = os.getenv("NAVER_CLIENT_ID")
+    if not cid:
+        sys.exit("NAVER_CLIENT_ID가 없습니다. .env를 먼저 만드세요.")
+    found = collect.search_news(set_row["keywords"], hours=hours, client_id=cid,
+                                client_secret=os.getenv("NAVER_CLIENT_SECRET"))
+    print(f"수집 {len(found['items'])}건 — 이 기사들로 모든 세팅을 돌린다\n")
+    return found
 
 
-def exp_model(conn, set_name, hours, models):
+def _run_variant(set_row, found, label, hours, model=None, drop_criteria=False,
+                 seconds=3600):
+    """세팅 하나를 격리된 임시 DB에서 돌린다.
+
+    같은 DB를 재사용하면 앞 세팅이 만든 스레드를 뒤 세팅이 '과거 이력'으로 읽어
+    전부 후속으로 판정한다. 비교가 성립하려면 이력이 비어 있어야 한다.
+    """
+    # ignore_cleanup_errors: Windows는 닫은 직후의 SQLite 파일을 잠시 잡고 있어
+    # 임시 폴더 삭제가 실패한다. 결과와 무관한 정리 단계이므로 무시한다.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        conn = db.connect(Path(tmp) / "eval.db")
+        try:
+            db.init_db(conn)
+            sid = db.get_or_create_set(
+                conn, set_row["name"], set_row["keywords"],
+                description=set_row["description"],
+                criteria="" if drop_criteria else set_row["criteria"],
+                org_names=",".join(set_row["org_names"]))
+
+            # run_agent가 items에 _id를 심으므로 세팅마다 복사본을 준다
+            payload = copy.deepcopy(found)
+
+            def fixed_search(keywords, hours=24, **kw):
+                return payload
+
+            t0 = time.time()
+            # 실험에서는 시간 상한이 결과를 자르면 안 된다. 느린 모델이 불리해진다.
+            rid = agent.run_agent(conn, sid, hours=hours, model=model,
+                                  limits={"seconds": seconds},
+                                  search_fn=fixed_search, judge_fn=llm.judge)
+            elapsed = time.time() - t0
+
+            run = db.get_run(conn, rid)
+            threads = [dict(r) for r in conn.execute(
+                "SELECT importance, status, reason FROM thread")]
+            judged = [t for t in threads if t["status"] == "judged"]
+            dist = {g: sum(1 for t in judged if t["importance"] == g)
+                    for g in ["최우선", "필수", "참고"]}
+            avg_len = (sum(len(t["reason"] or "") for t in judged) / len(judged)
+                       if judged else 0)
+        finally:
+            conn.close()
+
+    return [label, run["thread_count"], len(judged), len(threads) - len(judged),
+            f"{elapsed:.0f}초", run["tokens_in"], f"${run['cost']:.4f}",
+            dist["최우선"], dist["필수"], dist["참고"], f"{avg_len:.0f}자"]
+
+
+def exp_model(conn, set_name, hours, models, seconds=3600):
     s = db.get_set(conn, set_name)
-    print(f"\n[나] 모델 비교 — {set_name}, 최근 {hours}시간\n")
-    table(HEAD, [_run_variant(conn, s["id"], hours, m, model=m) for m in models])
+    print(f"\n[나] 모델 비교 — {set_name}, 최근 {hours}시간")
+    found = _fetch_once(s, hours)
+    table(HEAD, [_run_variant(s, found, m, hours, model=m, seconds=seconds)
+                 for m in models])
+    print("※ 모든 세팅이 같은 기사·빈 이력에서 출발한다. 모델만 다르다.")
     print("※ 누락률은 각 실행을 화면에서 검토·확정한 뒤 수정률 지표로 확인한다.")
 
 
-def exp_prompt(conn, set_name, hours):
+def exp_prompt(conn, set_name, hours, model=None):
     s = db.get_set(conn, set_name)
-    print(f"\n[다] 중요도 기준 유무 — {set_name}, 최근 {hours}시간\n")
+    print(f"\n[다] 중요도 기준 유무 — {set_name}, 최근 {hours}시간")
+    found = _fetch_once(s, hours)
     table(HEAD, [
-        _run_variant(conn, s["id"], hours, "기준 없음", drop_criteria=True),
-        _run_variant(conn, s["id"], hours, "기준 명시"),
+        _run_variant(s, found, "기준 없음", hours, model=model, drop_criteria=True),
+        _run_variant(s, found, "기준 명시", hours, model=model),
     ])
     print("※ 기준이 없으면 모델은 '일반적인 뉴스 중요도'로 판단한다.")
     print("   최우선 분포가 어떻게 달라지는지가 이 실험의 관전 포인트다.")
@@ -153,6 +196,8 @@ def main():
     ap.add_argument("--hours", type=int, default=24)
     ap.add_argument("--models", default="qwen3.5:2b")
     ap.add_argument("--thresholds", default="0.25,0.30,0.35,0.40,0.45,0.50,0.60")
+    ap.add_argument("--seconds", type=int, default=3600,
+                    help="세팅당 시간 상한. 실험에서는 결과가 잘리지 않게 넉넉히 준다")
     args = ap.parse_args()
 
     load_env()
@@ -164,9 +209,10 @@ def main():
     elif args.experiment == "cluster":
         exp_cluster(conn, args.set, [float(t) for t in args.thresholds.split(",")])
     elif args.experiment == "model":
-        exp_model(conn, args.set, args.hours, args.models.split(","))
+        exp_model(conn, args.set, args.hours, args.models.split(","), args.seconds)
     else:
-        exp_prompt(conn, args.set, args.hours)
+        exp_prompt(conn, args.set, args.hours,
+                   model=args.models.split(",")[0] if args.models else None)
 
 
 if __name__ == "__main__":

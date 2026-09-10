@@ -62,15 +62,24 @@ def fake_search(items, truncated=(), failed=()):
     return search
 
 
+GRADE_CODE = {"최우선": ("B", "사회연대경제기본법"), "필수": ("C", ""), "참고": ("none", "")}
+
+
 def fake_judge(grade="필수", need_body=False, calls=None):
+    """모델은 code/law만 돌려준다. 등급은 agent.grade_of()가 매긴다."""
+    code, law = GRADE_CODE[grade]
+
     def judge(system, user, schema, model=None, **kw):
         if calls is not None:
             calls.append(user)
         ids = [int(line.split(".")[0]) for line in user.splitlines()
                if line and line[0].isdigit()]
         want = need_body and not any("본문:" in l for l in user.splitlines())
-        return ({"results": [{"id": i, "importance": grade, "reason": f"{i}번 근거",
-                              "need_body": want,
+        titles = [l.split(". ", 1)[1].split(" (기사")[0] for l in user.splitlines()
+                  if l and l[0].isdigit() and ". " in l]
+        return ({"results": [{"id": i, "title_head": titles[i - 1][:10],
+                              "code": code, "law": law,
+                              "reason": f"{i}번 근거", "need_body": want,
                               "need_body_reason": "개정 내용이 요약에서 잘림"}
                              for i in ids]},
                 {"in": 400, "out": 100, "seconds": 1.0, "model": "fake",
@@ -262,3 +271,81 @@ def test_empty_results_leaves_batch_unjudged():
     """개수가 안 맞으면 억지로 끼워맞추지 않는다. 미판정으로 남겨 재개하게 한다."""
     assert agent._collect_verdicts({"results": []}, _batch(), {}) == {}
     assert agent._collect_verdicts({"results": [{"id": 9}]}, _batch(), {}) == {}
+
+
+# --- 등급 매핑 ---------------------------------------------------------------
+
+def test_grade_is_derived_from_code_not_chosen_by_model():
+    assert agent.grade_of({"code": "B", "law": "사회연대경제기본법"})[0] == "최우선"
+    assert agent.grade_of({"code": "C", "law": ""})[0] == "필수"
+    assert agent.grade_of({"code": "none", "law": ""})[0] == "참고"
+
+
+def test_b_law_must_appear_in_the_article():
+    """모델이 댄 법령명이 기사에 없으면 강등한다.
+
+    법령명을 필수로 만들었더니 프롬프트의 '기존 이슈' 목록에서 이름을 베껴 와
+    검증을 통과했다 — 자금 지원 기사에 '사회연대경제기본법 통과'.
+    """
+    v = {"code": "B", "law": "사회연대경제기본법", "reason": "법 통과"}
+    ok, _ = agent.grade_of(v, "국회에서 사회연대경제기본법이 통과됐다")
+    assert ok == "최우선"
+    bad, why = agent.grade_of(v, "새마을금고가 사회연대경제에 1.1조를 푼다")
+    assert bad == "참고" and "기사에 없음" in why
+
+
+def test_law_match_ignores_spacing():
+    v = {"code": "B", "law": "사회연대경제 기본법"}
+    assert agent.grade_of(v, "…사회연대경제기본법 시행령…")[0] == "최우선"
+
+
+def test_code_a_is_rejected_when_no_org_registered():
+    """A는 조직명이 등록됐을 때만 유효하다. 프롬프트에서 빼도 모델이 낼 수 있다."""
+    v = {"code": "A", "law": "", "reason": "조직 언급"}
+    grade, why = agent.grade_of(v, "현대차가 기증했다", a_enabled=False)
+    assert grade == "참고" and "미등록" in why
+    assert agent.grade_of(v, "우리재단 소식", a_enabled=True)[0] == "최우선"
+
+
+def test_b_without_law_name_is_demoted():
+    """법령명 없는 B 주장은 참고로 내린다.
+
+    실측에서 최우선 9건의 근거가 전부 '법령명 없는 B·법 제정'이었다.
+    프롬프트로 막히지 않아 코드로 막는다.
+    """
+    grade, why = agent.grade_of({"code": "B", "law": "   ", "reason": "B·법 제정"})
+    assert grade == "참고"
+    assert "법령명" in why
+
+
+def test_unknown_code_falls_back_to_lowest():
+    assert agent.grade_of({})[0] == "참고"
+    assert agent.grade_of({"code": "Z"})[0] == "참고"
+
+
+def test_verdicts_realign_when_model_shuffles_content():
+    """모델이 id는 맞게 내면서 내용을 섞어 답하면 제목으로 바로잡는다.
+
+    실제로 의원 발언 기사에 통합돌봄 사업 근거가 붙는 일이 있었다.
+    """
+    batch = [{"n": 1, "title": "전종규 동해시의원 개편 요구", "items": [], "label": "신규"},
+             {"n": 2, "title": "김제시 통합돌봄 경사로 설치", "items": [], "label": "신규"},
+             {"n": 3, "title": "영월군복지관 템플스테이", "items": [], "label": "신규"}]
+    # id는 1,2,3인데 내용이 한 칸씩 밀려 있다
+    parsed = {"results": [
+        {"id": 1, "title_head": "김제시 통합돌봄 경사", "code": "D", "reason": "통합돌봄"},
+        {"id": 2, "title_head": "영월군복지관 템플스테", "code": "E", "reason": "템플스테이"},
+        {"id": 3, "title_head": "전종규 동해시의원 개", "code": "C", "reason": "의원 발언"},
+    ]}
+    v = agent._collect_verdicts(parsed, batch, {})
+    assert v[1]["reason"] == "의원 발언"      # 1번 = 전종규
+    assert v[2]["reason"] == "통합돌봄"       # 2번 = 김제시
+    assert v[3]["reason"] == "템플스테이"     # 3번 = 영월군
+
+
+def test_title_head_match_ignores_spacing():
+    batch = [{"n": 1, "title": "사회연대경제 기본법 통과", "items": [], "label": "신규"}]
+    parsed = {"results": [{"id": 9, "title_head": "사회연대경제기본법통", "code": "B",
+                           "law": "사회연대경제기본법", "reason": "통과"}]}
+    v = agent._collect_verdicts(parsed, batch, {})
+    assert v[1]["reason"] == "통과"           # id가 틀려도 제목으로 찾는다

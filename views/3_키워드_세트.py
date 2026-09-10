@@ -35,19 +35,30 @@ with tab_edit:
         name = st.selectbox("세트", [s["name"] for s in sets])
         cur = db.get_set(conn, name)
 
-        # --- 수정률: 재검토 시점을 사람이 기억할 필요 없이 숫자가 알려준다
+        # --- 재검토 시점을 사람이 기억할 필요 없이 숫자가 알려준다
         stat = db.revision_rate(conn, cur["id"], days=30)
-        c = st.columns([1, 1, 3])
+        miss = db.miss_rate(conn, cur["id"], days=30)
+        c = st.columns(4)
         c[0].metric("확정 이슈 (30일)", stat["total"])
-        c[1].metric("수정률", f"{stat['rate'] * 100:.0f}%")
-        with c[2]:
-            st.write("")
-            if stat["total"] < 5:
-                st.caption("표본이 적습니다. 며칠 더 운영한 뒤 판단하세요.")
-            elif stat["rate"] >= 0.20:
-                st.warning("수정률이 높습니다. 중요도 기준이나 프롬프트를 점검하세요.")
-            else:
-                st.success("에이전트 판단이 대체로 일치합니다.")
+        c[1].metric("수정률", f"{stat['rate'] * 100:.0f}%",
+                    help="확정할 때 라벨이나 중요도를 하나라도 고친 비율")
+        c[2].metric("누락률", f"{miss['rate'] * 100:.0f}%",
+                    help="에이전트가 낮게 본 것을 사람이 올린 비율. "
+                         "놓칠 뻔한 건이므로 가장 중요한 지표다")
+        c[3].metric("과잉", f"{miss['over']}건",
+                    help="에이전트가 높게 본 것을 사람이 내린 건수. "
+                         "귀찮을 뿐 놓치는 것은 아니다")
+
+        if stat["total"] < 5:
+            st.caption("표본이 적습니다. 며칠 더 운영한 뒤 판단하세요.")
+        elif miss["rate"] >= 0.10:
+            st.error(f"**누락률 {miss['rate'] * 100:.0f}%** — 놓칠 뻔한 건이 "
+                     f"{miss['missed']}건 있었습니다. 중요도 기준을 손볼 시점입니다. "
+                     "(수용 기준: 10% 이하)")
+        elif stat["rate"] >= 0.20:
+            st.warning("누락은 적지만 수정이 잦습니다. 과잉 판정 쪽을 점검하세요.")
+        else:
+            st.success("에이전트 판단이 대체로 일치합니다. 상위부터 훑어도 됩니다.")
 
         st.divider()
         desc = st.text_area(

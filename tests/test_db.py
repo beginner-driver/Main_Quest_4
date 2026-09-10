@@ -100,3 +100,31 @@ def test_run_and_steps_are_recorded(conn):
     run = db.get_run(conn, rid)
     assert run["status"] == "done" and run["item_count"] == 112
     assert run["truncated"] == "사회적기업"
+
+
+def test_miss_rate_counts_only_upgrades(conn):
+    """누락률은 방향을 구분한다. 사람이 등급을 '올린' 것만 누락으로 센다.
+
+    AI가 과하게 올린 것을 내리는 건 귀찮을 뿐 놓치는 게 아니다.
+    """
+    s = db.get_or_create_set(conn, "세트", ["가"])
+    mk = lambda t, g: db.save_thread(conn, s, None, t, "2026-09-09", "2026-09-09",
+                                     importance=g)
+    missed = mk("놓칠 뻔", "참고")      # AI 참고 → 사람 최우선
+    over = mk("과했던 것", "최우선")     # AI 최우선 → 사람 참고
+    same = mk("그대로", "필수")
+
+    db.confirm_thread(conn, missed, "신규", "최우선")
+    db.confirm_thread(conn, over, "신규", "참고")
+    db.confirm_thread(conn, same, "신규", "필수")
+
+    stat = db.miss_rate(conn, s)
+    assert stat["total"] == 3
+    assert stat["missed"] == 1          # 올린 것만
+    assert stat["over"] == 1            # 내린 것은 따로 센다
+    assert stat["rate"] == pytest.approx(1 / 3)
+
+
+def test_miss_rate_is_zero_when_nothing_confirmed(conn):
+    s = db.get_or_create_set(conn, "빈세트", ["가"])
+    assert db.miss_rate(conn, s) == {"total": 0, "missed": 0, "over": 0, "rate": 0.0}

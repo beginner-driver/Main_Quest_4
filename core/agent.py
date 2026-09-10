@@ -15,12 +15,19 @@ from . import cluster, db, llm, tools
 
 BATCH = 3          # §9.7: 5개 배치에서 후반 붕괴가 관찰됐다
 
-# 실측: CPU 추론에서 배치당 29초, 60묶음이면 약 10분.
-# 매일 도는 배경 작업이므로 20분까지 열어둔다. 상한에 닿아도 미판정 묶음은
+# 실측(qwen3:4b, CPU 추론): 배치당 60~80초, 65묶음이면 약 30분.
+# 매일 한 번 도는 배경 작업이므로 30분까지 열어둔다. 상한에 닿아도 미판정 묶음은
 # 목록에 남고 --resume으로 이어서 진행할 수 있다.
-LIMITS = {"iterations": 3, "fetch": 3, "seconds": 1200, "tokens": 50_000}
+LIMITS = {"iterations": 3, "fetch": 3, "seconds": 1800, "tokens": 50_000}
 
 GRADES = ["최우선", "필수", "참고"]
+CODES = ["A", "B", "C", "D", "E", "F", "none"]
+
+# 등급은 모델이 고르지 않는다. 어느 항목에 해당하는지만 고르게 하고 코드가 매핑한다.
+# 자유도를 줄일수록 작은 모델이 덜 흔들린다.
+CODE_GRADE = {"A": "최우선", "B": "최우선",
+              "C": "필수", "D": "필수", "E": "필수", "F": "필수",
+              "none": "참고"}
 
 JUDGE_SCHEMA = {
     "type": "object",
@@ -31,17 +38,50 @@ JUDGE_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "id": {"type": "integer"},
-                    "importance": {"type": "string", "enum": GRADES},
+                    "title_head": {"type": "string"},
+                    "code": {"type": "string", "enum": CODES},
+                    "law": {"type": "string"},
                     "reason": {"type": "string"},
                     "need_body": {"type": "boolean"},
                     "need_body_reason": {"type": "string"},
                 },
-                "required": ["id", "importance", "reason", "need_body"],
+                "required": ["id", "title_head", "code", "law", "reason", "need_body"],
             },
         }
     },
     "required": ["results"],
 }
+
+
+def _squash(s):
+    return "".join((s or "").split())
+
+
+def grade_of(verdict, source_text="", a_enabled=False):
+    """판정을 등급으로 옮기고, 모델의 주장을 기사 원문으로 검증한다.
+
+    '법령 이름을 못 적으면 B가 아니다'를 프롬프트에 써도 모델은 무시했다.
+    실측에서 최우선 9건의 근거가 전부 '법령명 없는 B·법 제정'이었다.
+    그래서 법령명을 필수로 만들었더니, 이번에는 프롬프트의 '기존 이슈' 목록에서
+    법 이름을 베껴 와 검증을 통과했다 — 자금 지원 기사에 '사회연대경제기본법 통과'.
+
+    그래서 한 단계 더 조인다. **그 법 이름이 이 기사에 실제로 있어야 한다.**
+    모델이 문맥에서 주워 온 이름은 기사 본문과 대조하면 걸러진다.
+    """
+    code = verdict.get("code") or "none"
+
+    if code == "A" and not a_enabled:
+        # 조직명 미등록이면 프롬프트에서 A를 빼지만, 모델이 A를 낼 수는 있다.
+        return "참고", "A 주장했으나 감지 대상 조직 미등록"
+
+    if code == "B":
+        law = (verdict.get("law") or "").strip()
+        if not law:
+            return "참고", "B 주장했으나 근거 법령명 없음"
+        if source_text and _squash(law) not in _squash(source_text):
+            return "참고", f"'{law}'이(가) 기사에 없음"
+
+    return CODE_GRADE.get(code, "참고"), None
 
 SYSTEM = """당신은 '{name}' 뉴스 모니터링 담당자입니다.
 {description}
@@ -53,10 +93,16 @@ SYSTEM = """당신은 '{name}' 뉴스 모니터링 담당자입니다.
 기사에 기관이나 기업 이름이 나온다는 사실만으로는 등급을 올리지 않습니다.
 어느 기준에도 뚜렷이 해당하지 않으면 '참고'입니다.
 
-각 묶음에 importance(최우선/필수/참고)와 reason을 매기세요.
+각 묶음에 title_head와 code와 law와 reason을 매기세요. 등급은 매기지 않습니다.
 
-reason은 25자 이내로 짧게 쓰세요. 등급의 근거만 적습니다.
-  좋은 예: "B·법 제정" / "C·공모 공고, 마감 있음" / "지역 행사"
+title_head — 그 묶음 제목의 맨 앞 10글자를 그대로 옮겨 적습니다.
+             어느 묶음을 판정한 것인지 대조하는 데 씁니다. 바꾸거나 요약하지 마세요.
+code — 위 기준의 어느 항목에 해당하는지 하나만 고릅니다. A~F, 해당 없으면 none.
+law  — code가 B일 때만, 기사에 실제로 나온 법령·조례 이름을 적습니다.
+       기사에서 법령 이름을 찾을 수 없으면 code는 B가 아닙니다. 빈 문자열로 두세요.
+       (법령명이 없는 B는 자동으로 참고로 내려갑니다)
+reason — 25자 이내. 그 code를 고른 근거만 짧게.
+  좋은 예: "사회연대경제기본법 통과" / "공모 공고, 마감 있음" / "지역 행사"
   나쁜 예: "지역 행사 및 홍보성 기사로 사회연대경제 생태계 동향과 직접 관련이 없음"
 반드시 그 묶음의 내용으로 직접 쓰세요. 다른 묶음이나 입력 문장을 그대로 옮기지 마세요.
 
@@ -104,15 +150,46 @@ def _render(batch, bodies):
     return "\n".join(out)
 
 
+def _head_match(title, echoed, least=6):
+    """제목과 모델이 옮겨 적은 앞부분이 같은 항목을 가리키는지.
+
+    모델은 띄어쓰기를 포함해 10글자를 세고 이쪽은 공백을 지운 뒤 비교하므로
+    길이가 어긋난다. 그래서 자른 길이를 맞추려 하지 않고 앞부분 일치로 본다.
+    """
+    a, b = _squash(title), _squash(echoed)
+    if len(b) < least:
+        return False
+    return a.startswith(b) or b.startswith(a)
+
+
 def _collect_verdicts(parsed, batch, verdicts):
-    """응답을 배치 항목에 대응시킨다. id가 어긋나면 순서로 받는다."""
-    results = parsed.get("results") or []
-    for k in range(1, len(batch) + 1):
-        r = next((x for x in results if x.get("id") == k), None)
+    """응답을 배치 항목에 대응시킨다.
+
+    id만 믿으면 안 된다. 모델이 id는 1,2,3으로 맞게 내면서 내용을 한 칸씩 밀어
+    답한 적이 있다 — 의원 발언 기사에 통합돌봄 사업 근거가 붙었다. 엉뚱한 기사에
+    엉뚱한 근거가 달리는 건 이 도구가 막으려는 바로 그 오류다.
+
+    그래서 모델에게 제목 앞부분(title_head)을 같이 적게 하고 그걸로 먼저 맞춘다.
+    id는 그다음, 순서는 마지막 수단이다.
+    """
+    results = list(parsed.get("results") or [])
+    taken = set()
+
+    def claim(r):
+        taken.add(id(r))
+        return r
+
+    for k, c in enumerate(batch, start=1):
+        r = next((x for x in results
+                  if id(x) not in taken
+                  and _head_match(c["title"], x.get("title_head", ""))), None)
+        if r is None:
+            r = next((x for x in results
+                      if id(x) not in taken and x.get("id") == k), None)
         if r is None and len(results) == len(batch):
-            r = results[k - 1]          # id를 못 지켰어도 개수가 맞으면 순서로 매칭
-        if r:
-            verdicts[k] = r
+            r = results[k - 1] if id(results[k - 1]) not in taken else None
+        if r is not None:
+            verdicts[k] = claim(r)
     return verdicts
 
 
@@ -236,10 +313,14 @@ def run_agent(conn, keyword_set_id, hours=24, limits=None, model=None,
                 continue                    # 판정 못 받은 묶음은 pending으로 남는다
             # first_seen/last_seen은 건드리지 않는다. save_thread를 재사용하면
             # 빈 문자열로 덮어써서 이 스레드가 이력 조회에서 통째로 빠진다.
+            src = c["title"] + " " + " ".join(
+                (i.get("description") or "") for i in c["items"])
+            grade, demoted = grade_of(v, src, a_enabled=bool(set_row.get("org_names")))
+            reason = f"{v['reason']} ({demoted})" if demoted else v["reason"]
             conn.execute(
                 "UPDATE thread SET importance=?, agent_importance=?, reason=?,"
-                " status='judged' WHERE id=?",
-                (v["importance"], v["importance"], v["reason"], c["tid"]))
+                " agent_code=?, agent_law=?, status='judged' WHERE id=?",
+                (grade, grade, reason, v.get("code"), v.get("law"), c["tid"]))
             judged += 1
         conn.commit()
 
@@ -293,10 +374,14 @@ def resume(conn, run_id, limits=None, model=None, judge_fn=None):
             v = verdicts.get(k)
             if not v:
                 continue
+            src = c["title"] + " " + " ".join(
+                (i.get("description") or "") for i in c["items"])
+            grade, demoted = grade_of(v, src, a_enabled=bool(set_row.get("org_names")))
+            reason = f"{v['reason']} ({demoted})" if demoted else v["reason"]
             conn.execute(
                 "UPDATE thread SET importance=?, agent_importance=?, reason=?,"
-                " status='judged' WHERE id=?",
-                (v["importance"], v["importance"], v["reason"], c["tid"]))
+                " agent_code=?, agent_law=?, status='judged' WHERE id=?",
+                (grade, grade, reason, v.get("code"), v.get("law"), c["tid"]))
             judged += 1
         conn.commit()
 
