@@ -263,10 +263,27 @@ Ollama가 실행 중이 아니면 통합 테스트 1개는 자동으로 건너�
 
 | 확장 | 방법 |
 |---|---|
+| **자동 실행** | **구현됨** — 아래 참조 |
 | 게시판 감시 (채용·사업공고) | `core/collect_board.py` + `views/5_게시판_감시.py` 추가, `item.source`에 `board_*` |
-| 자동 실행 | Windows 작업 스케줄러에서 `python main.py --hours 24` 등록 |
-| n8n 연동 | Execute Command 노드로 위 CLI 호출 + 슬랙·메일 발송 |
+| n8n 연동 | Execute Command 노드로 CLI 호출 + 슬랙·메일 발송 |
 | 다른 모델 | `.env`의 `OLLAMA_MODEL` 변경, 또는 `core/llm.py`의 `judge()` 교체 |
+
+### 자동 실행 (사람이 시작하지 않아도 도는 워크플로)
+
+```bash
+scriptsegister_task.bat          # 매일 08:00 자동 실행 등록
+```
+
+| 명령 | 하는 일 |
+|---|---|
+| `scriptsegister_task.bat` | Windows 작업 스케줄러에 등록 |
+| `schtasks /run /tn "IssueRadar"` | 지금 한 번 돌려보기 |
+| `schtasks /query /tn "IssueRadar" /v /fo list` | 등록 상태 확인 |
+| `schtasks /delete /tn "IssueRadar" /f` | 해제 |
+
+`scripts\daily.bat`이 실제 진입점이다. Ollama를 먼저 깨우고, 결과를 `data/cron.log`에 누적한다 — **스케줄러는 실패해도 조용하므로 로그가 유일한 확인 수단이다.**
+
+아침에 출근하면 판정이 끝나 있고, 사람은 `streamlit run app.py`로 검토·승인만 하면 된다.
 
 **확장을 위한 사전 코드는 두지 않는다.** 구현체가 하나뿐인 인터페이스는 두 번째가 왔을 때 거의 맞지 않아 다시 짜게 된다. 이 설계가 확장 가능한 이유는 확장 지점을 만들어둬서가 아니라 층이 분리되어 있어서다.
 
